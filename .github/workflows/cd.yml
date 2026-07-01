@@ -1,0 +1,135 @@
+name: CD
+
+on:
+  push:
+    branches: [main]
+
+jobs:
+  # ─────────────────────────────────────────────
+  # Build Vue app
+  # ─────────────────────────────────────────────
+  build:
+    name: Build
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Set up Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: "22"
+          cache: "npm"
+          cache-dependency-path: frontend/package-lock.json
+
+      - name: Install dependencies
+        run: npm ci
+        working-directory: frontend
+
+      - name: Build
+        run: npm run build
+        working-directory: frontend
+        env:
+          VITE_API_BASE_URL: ${{ secrets.VITE_API_BASE_URL }}
+
+      - name: Upload dist artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: dist
+          path: frontend/dist/
+          retention-days: 1
+
+  # ─────────────────────────────────────────────
+  # Deploy to AWS — S3 + CloudFront invalidation
+  # ─────────────────────────────────────────────
+  deploy-aws:
+    name: Deploy to AWS (S3 + CloudFront)
+    runs-on: ubuntu-latest
+    needs: build
+
+    steps:
+      - name: Download dist artifact
+        uses: actions/download-artifact@v4
+        with:
+          name: dist
+          path: dist/
+
+      - name: Configure AWS credentials
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
+          aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          aws-region: ${{ secrets.AWS_REGION }}
+
+      # Sync dist/ to S3 — delete files no longer present (clean deploy)
+      # Assets (hashed filenames) get 1-year cache. index.html gets no-cache.
+      - name: Upload to S3
+        run: |
+          # Upload assets with long cache (Vite hashes filenames)
+          aws s3 sync dist/ s3://${{ secrets.S3_BUCKET_NAME }} \
+            --delete \
+            --cache-control "max-age=31536000,immutable" \
+            --exclude "index.html"
+
+          # Upload index.html with no-cache so deploys propagate immediately
+          aws s3 cp dist/index.html s3://${{ secrets.S3_BUCKET_NAME }}/index.html \
+            --cache-control "no-cache,no-store,must-revalidate"
+
+      - name: Invalidate CloudFront cache
+        run: |
+          aws cloudfront create-invalidation \
+            --distribution-id ${{ secrets.CLOUDFRONT_DISTRIBUTION_ID }} \
+            --paths "/*"
+
+  # ─────────────────────────────────────────────
+  # Deploy to Azure — Blob Storage
+  # ─────────────────────────────────────────────
+  deploy-azure:
+    name: Deploy to Azure (Blob Storage)
+    runs-on: ubuntu-latest
+    needs: build
+    if: false  # Disabled — not using Azure yet
+
+    steps:
+      - name: Download dist artifact
+        uses: actions/download-artifact@v4
+        with:
+          name: dist
+          path: dist/
+
+      - name: Azure Login
+        uses: azure/login@v1
+        with:
+          creds: ${{ secrets.AZURE_CREDENTIALS }}
+
+      # Upload dist/ to the $web container (Azure static website container)
+      # index.html gets no-cache; assets get long cache
+      - name: Upload to Azure Blob
+        uses: azure/CLI@v1
+        with:
+          inlineScript: |
+            az storage blob upload-batch \
+              --account-name ${{ secrets.AZURE_STORAGE_ACCOUNT }} \
+              --destination '$web' \
+              --source dist/ \
+              --overwrite \
+              --content-cache-control "max-age=31536000,immutable" \
+              --pattern "assets/*"
+
+            az storage blob upload \
+              --account-name ${{ secrets.AZURE_STORAGE_ACCOUNT }} \
+              --container-name '$web' \
+              --name index.html \
+              --file dist/index.html \
+              --content-cache-control "no-cache,no-store,must-revalidate" \
+              --overwrite
+
+      - name: Purge Azure CDN cache
+        uses: azure/CLI@v1
+        with:
+          inlineScript: |
+            az cdn endpoint purge \
+              --resource-group ${{ secrets.AKS_RESOURCE_GROUP }} \
+              --profile-name proj-devops-frontend-cdn \
+              --name proj-devops-frontend \
+              --content-paths "/*"
